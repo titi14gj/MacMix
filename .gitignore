@@ -45,3 +45,6 @@ playground.xcworkspace
 
 .codex
 AGENTS.md
+
+# Local diagnostic build transcript
+/build-diagnostic.log

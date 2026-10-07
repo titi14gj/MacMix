@@ -14,6 +14,41 @@ import IOKit
 import IOKit.i2c
 #endif
 
+// Diagnostic-only logging; no additional DDC queries or writes are performed.
+nonisolated final class DDCDiagnosticLog: @unchecked Sendable {
+    static let shared = DDCDiagnosticLog()
+    private let lock = NSLock()
+    private let file: URL
+
+    private init() {
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/MacMix-DDC-Diagnostic", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        file = directory.appendingPathComponent("ddc-\(Int(Date().timeIntervalSince1970))-\(ProcessInfo.processInfo.processIdentifier).log")
+        FileManager.default.createFile(atPath: file.path, contents: Data())
+        write("SESSION source=7412749 bundle=\(Bundle.main.bundleIdentifier ?? "unknown") pid=\(ProcessInfo.processInfo.processIdentifier)")
+    }
+
+    static func hex(_ bytes: [UInt8]) -> String {
+        bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
+    }
+
+    func write(_ message: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        do {
+            let handle = try FileHandle(forWritingTo: file)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+        } catch {
+            NSLog("DDC diagnostic log error: %@", String(describing: error))
+        }
+    }
+}
+
 nonisolated struct ExternalDisplayDescriptor: Sendable {
     let id: CGDirectDisplayID
     let name: String
@@ -102,10 +137,12 @@ nonisolated final class DisplayVolumeController: @unchecked Sendable {
     }
 
     func setVolume(_ volume: Double, routeUID: String) {
+        DDCDiagnosticLog.shared.write("REQUEST_VOLUME slider=\(volume) route=\(routeUID)")
         schedule(.volume(routeUID: routeUID, value: volume))
     }
 
     func setMuted(_ isMuted: Bool, audibleVolume: Double, routeUID: String) {
+        DDCDiagnosticLog.shared.write("REQUEST_MUTE muted=\(isMuted) audibleVolume=\(audibleVolume) route=\(routeUID)")
         schedule(
             .mute(
                 routeUID: routeUID,
@@ -121,6 +158,7 @@ nonisolated final class DisplayVolumeController: @unchecked Sendable {
     ) -> DisplayVolumeSnapshot? {
         guard let display = targetDisplay(for: candidate, displays: displays),
               let transport = makeTransport(for: display) else {
+            DDCDiagnosticLog.shared.write("ACTIVATE failed=no-display-or-transport route=\(candidate.uid)")
             activeRoute = nil
             return nil
         }
@@ -129,10 +167,15 @@ nonisolated final class DisplayVolumeController: @unchecked Sendable {
         var volume = cachedVolume ?? Self.safeInitialVolume
         var maximumVolume = UInt16(100)
 
+        DDCDiagnosticLog.shared.write("ACTIVATE display=\(display.name) cachedVolume=\(String(describing: cachedVolume)) defaultMaximum=100")
+
         if let values = transport.read(command: Self.speakerVolumeCommand),
            values.maximum > 0 {
             maximumVolume = values.maximum
             volume = Double(min(values.current, values.maximum)) / Double(values.maximum)
+            DDCDiagnosticLog.shared.write("ACTIVATE_READ success current=\(values.current) maximum=\(values.maximum) normalized=\(volume)")
+        } else {
+            DDCDiagnosticLog.shared.write("ACTIVATE_READ failed-or-zero-maximum fallbackVolume=\(volume) maximumUsed=\(maximumVolume)")
         }
 
         volume = Self.clampedVolume(volume)
@@ -216,6 +259,7 @@ nonisolated final class DisplayVolumeController: @unchecked Sendable {
                 }
 
                 let volume = Self.clampedVolume(value)
+                DDCDiagnosticLog.shared.write("WRITE_VOLUME slider=\(volume) maximumUsed=\(activeRoute.maximumVolume) value=\(Self.ddcValue(for: volume, maximum: activeRoute.maximumVolume))")
                 _ = activeRoute.transport.write(
                     command: Self.speakerVolumeCommand,
                     value: Self.ddcValue(for: volume, maximum: activeRoute.maximumVolume)
@@ -228,6 +272,7 @@ nonisolated final class DisplayVolumeController: @unchecked Sendable {
                 }
 
                 // MCCS defines 1 as muted and 2 as unmuted for VCP 0x8D.
+                DDCDiagnosticLog.shared.write("WRITE_MUTE muted=\(isMuted) command=8D value=\(isMuted ? 1 : 2) fallbackVolume=\(isMuted ? 0 : Self.clampedVolume(audibleVolume)) maximumUsed=\(activeRoute.maximumVolume)")
                 // Also write 0x62 so monitors that omit 0x8D still behave correctly.
                 _ = activeRoute.transport.write(
                     command: Self.audioMuteCommand,
@@ -335,21 +380,25 @@ nonisolated private final class Arm64DDCTransport: DDCTransport, @unchecked Send
 
     func read(command: UInt8) -> (current: UInt16, maximum: UInt16)? {
         var reply = [UInt8](repeating: 0, count: 11)
+        DDCDiagnosticLog.shared.write("READ_BEGIN command=\(String(format: "%02X", command))")
 
         guard communicate(send: [command], reply: &reply),
               reply[2] == 0x02,
               reply[3] == 0x00,
               reply[4] == command else {
+            DDCDiagnosticLog.shared.write("READ_REJECT raw=\(DDCDiagnosticLog.hex(reply))")
             return nil
         }
 
         let maximum = UInt16(reply[6]) << 8 | UInt16(reply[7])
         let current = UInt16(reply[8]) << 8 | UInt16(reply[9])
+        DDCDiagnosticLog.shared.write("READ_ACCEPT command=\(String(format: "%02X", command)) current=\(current) maximum=\(maximum) raw=\(DDCDiagnosticLog.hex(reply))")
         return (current, maximum)
     }
 
     func write(command: UInt8, value: UInt16) -> Bool {
         var unusedReply: [UInt8] = []
+        DDCDiagnosticLog.shared.write("WRITE_BEGIN command=\(String(format: "%02X", command)) value=\(value) hex=\(String(format: "%04X", value))")
         return communicate(
             send: [command, UInt8(value >> 8), UInt8(value & 0xFF)],
             reply: &unusedReply
@@ -363,21 +412,24 @@ nonisolated private final class Arm64DDCTransport: DDCTransport, @unchecked Send
             : Self.chipAddress << 1 ^ Self.dataAddress
         packet[packet.count - 1] = Self.checksum(initial: initialChecksum, bytes: packet.dropLast())
 
-        for _ in 0 ..< 3 {
+        for attempt in 0 ..< 3 {
             var writeSucceeded = false
-            for _ in 0 ..< 2 {
+            for sendIndex in 0 ..< 2 {
                 usleep(10_000)
+                let sentPacket = DDCDiagnosticLog.hex(packet)
                 writeSucceeded = packet.withUnsafeMutableBytes { bytes in
                     guard let baseAddress = bytes.baseAddress else {
                         return false
                     }
-                    return writeIOAVI2C(
+                    let status = writeIOAVI2C(
                         service,
                         UInt32(Self.chipAddress),
                         UInt32(Self.dataAddress),
                         baseAddress,
                         UInt32(bytes.count)
-                    ) == kIOReturnSuccess
+                    )
+                    DDCDiagnosticLog.shared.write("IO_SEND attempt=\(attempt + 1) repeat=\(sendIndex + 1) address=\(Self.chipAddress) subAddress=\(Self.dataAddress) packet=\(sentPacket) status=\(String(format: "%08X", UInt32(bitPattern: status)))")
+                    return status == kIOReturnSuccess
                 }
             }
 
@@ -394,14 +446,17 @@ nonisolated private final class Arm64DDCTransport: DDCTransport, @unchecked Send
                 guard let baseAddress = bytes.baseAddress else {
                     return false
                 }
-                return readIOAVI2C(
+                let status = readIOAVI2C(
                     service,
                     UInt32(Self.chipAddress),
                     0,
                     baseAddress,
                     UInt32(bytes.count)
-                ) == kIOReturnSuccess
+                )
+                DDCDiagnosticLog.shared.write("IO_READ attempt=\(attempt + 1) status=\(String(format: "%08X", UInt32(bitPattern: status)))")
+                return status == kIOReturnSuccess
             }
+            DDCDiagnosticLog.shared.write("IO_REPLY attempt=\(attempt + 1) raw=\(DDCDiagnosticLog.hex(reply)) ioSuccess=\(readSucceeded) checksumOK=\(Self.checksum(initial: 0x50, bytes: reply.dropLast()) == reply.last)")
             if readSucceeded,
                Self.checksum(initial: 0x50, bytes: reply.dropLast()) == reply.last {
                 return true

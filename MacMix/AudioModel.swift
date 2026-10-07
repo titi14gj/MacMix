@@ -134,6 +134,7 @@ final class AudioModel: NSObject {
 
     override init() {
         super.init()
+        DDCDiagnosticLog.shared.write("MODEL_INIT")
         restoreCachedSystemAudioPermissionState()
 
         deviceObserver = CoreAudioDeviceObserver(
@@ -377,6 +378,7 @@ final class AudioModel: NSObject {
     }
 
     func setSystemOutputVolume(_ volume: Double) {
+        DDCDiagnosticLog.shared.write("SLIDER_CALLBACK value=\(volume) modelMuted=\(outputState.isSystemMuted) ddcActive=\(displayVolumeRouteUID != nil)")
         guard let currentOutputDevice else {
             return
         }
@@ -391,6 +393,7 @@ final class AudioModel: NSObject {
             if clampedVolume > 0.001 {
                 displayVolumeLastAudibleValue = clampedVolume
                 if outputState.isSystemMuted {
+                    DDCDiagnosticLog.shared.write("SLIDER_UNMUTE_BRANCH triggered=true")
                     displayVolumeController.setMuted(
                         false,
                         audibleVolume: clampedVolume,
@@ -421,6 +424,7 @@ final class AudioModel: NSObject {
     }
 
     func toggleSystemOutputMute() {
+        DDCDiagnosticLog.shared.write("MUTE_CALLBACK previousModelMuted=\(outputState.isSystemMuted)")
         guard let currentOutputDevice else {
             return
         }
